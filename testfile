@@ -1,0 +1,351 @@
+pipeline {
+    agent any
+    parameters {
+        
+        booleanParam(name: 'ALLOW_DESTROY', defaultValue: false, description: 'Allow Terraform Destroy')
+        booleanParam(name: 'IS_PRIVATE', defaultValue: true, description: 'Is Private Zone')
+        text(name: 'VPC_ASSOCIATIONS', description: 'VPC Associations in format: vpc_id1:region1,vpc_id2:region2')
+        choice(name: 'ROUTING_POLICY', choices: ['Simple', 'Weighted', 'Failover'], description: 'Select Routing Policy')
+        text(name: 'RDS_ENDPOINTS', description: 'Custom RDS endpoints in format: name1:endpoint1,name2:endpoint2')
+        text(name: 'RECORDS_SIMPLE', description: 'Records for Simple Routing in format: name,type,ttl,value', defaultValue: '')
+        text(name: 'RECORDS_WEIGHTED', description: 'Records for Weighted Routing in format: name,type,ttl,value,weight', defaultValue: '')
+        text(name: 'RECORDS_FAILOVER', description: 'Records for Failover Routing in format: name,type,ttl,value,failoverType', defaultValue: '')
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    checkout scm
+                }
+            }
+        }
+        stage('Prepare Terraform Variables') {
+            steps {
+                script {
+                    def vpc_associations = params.VPC_ASSOCIATIONS.tokenize(',').collect { entry ->
+                        def parts = entry.tokenize(':')
+                        return "{ vpc_id = \"${parts[0]}\", region = \"${parts[1]}\" }"
+                    }.join(', ')
+                    
+                    def rds_endpoints = params.RDS_ENDPOINTS.tokenize(',').collect { entry ->
+                        def parts = entry.tokenize(':')
+                        return "${parts[0]} = { custom_name = \"${parts[0]}\", endpoint = \"${parts[1]}\" }"
+                    }.join(', ')
+                    
+                    def records = []
+                    if (params.ROUTING_POLICY == 'Simple') {
+                        records = params.RECORDS_SIMPLE.tokenize(',').collate(4).collect { r ->
+                            "{ name = \"${r[0]}\", type = \"${r[1]}\", ttl = ${r[2]}, value_or_alias_target = \"${r[3]}\", routing_policy = \"Simple\", weight = null, failover = null, region = null, evaluate_health = null }"
+                        }
+                    } else if (params.ROUTING_POLICY == 'Weighted') {
+                        records = params.RECORDS_WEIGHTED.tokenize(',').collate(5).collect { r ->
+                            "{ name = \"${r[0]}\", type = \"${r[1]}\", ttl = ${r[2]}, value_or_alias_target = \"${r[3]}\", routing_policy = \"Weighted\", weight = ${r[4]}, failover = null, region = null, evaluate_health = null }"
+                        }
+                    } else if (params.ROUTING_POLICY == 'Failover') {
+                        records = params.RECORDS_FAILOVER.tokenize(',').collate(5).collect { r ->
+                            "{ name = \"${r[0]}\", type = \"${r[1]}\", ttl = ${r[2]}, value_or_alias_target = \"${r[3]}\", routing_policy = \"Failover\", weight = null, failover = \"${r[4]}\", region = null, evaluate_health = null }"
+                        }
+                    }
+                    
+                    writeFile file: 'terraform.tfvars', text: """
+                    
+                    allow_destroy = ${params.ALLOW_DESTROY}
+                    is_private = ${params.IS_PRIVATE}
+                    vpc_associations = [${vpc_associations}]
+                    routing_policy = \"${params.ROUTING_POLICY}\"
+                    rds_endpoints = { ${rds_endpoints} }
+                    records = [${records.join(', ')}]
+                    """
+                }
+            }
+        }
+        stage('Terraform Init & Apply') {
+            steps {
+                script {
+                    sh 'terraform init'
+                    sh 'terraform apply -auto-approve'
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                sh 'terraform destroy -auto-approve'
+            }
+        }
+    }
+}
+
+-----------------------------------------------------------------
+
+pipeline {
+    agent any
+    parameters {
+        
+        booleanParam(name: 'ALLOW_DESTROY', defaultValue: false, description: 'Allow Destroy?')
+        booleanParam(name: 'IS_PRIVATE', defaultValue: true, description: 'Is Private Zone?')
+        text(name: 'VPC_ASSOCIATIONS', description: 'VPC Associations in format: vpc_id1:region1,vpc_id2:region2')
+        
+        choice(name: 'ROUTING_POLICY', choices: ['Simple', 'Weighted', 'Failover'], description: 'Select Routing Policy')
+        text(name: 'RDS_ENDPOINTS', description: 'Custom RDS endpoints in format: name1:endpoint1,name2:endpoint2')
+        text(name: 'RECORDS_SIMPLE', description: 'Records for Simple Routing in format: name,type,ttl,value', defaultValue: '')
+        text(name: 'RECORDS_WEIGHTED', description: 'Records for Weighted Routing in format: name,type,ttl,value,weight', defaultValue: '')
+        text(name: 'RECORDS_FAILOVER', description: 'Records for Failover Routing in format: name,type,ttl,value,failoverType', defaultValue: '')
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    def vpcList = VPC_ASSOCIATIONS.tokenize(',').collect { entry ->
+                        def parts = entry.tokenize(':')
+                        return [vpc_id: parts[0], region: parts[1]]
+                    }
+                    def rdsList = RDS_ENDPOINTS.tokenize(',').collect { entry ->
+                        def parts = entry.tokenize(':')
+                        return [custom_name: parts[0], endpoint: parts[1]]
+                    }
+                    def records = []
+                    if (ROUTING_POLICY == 'Simple') {
+                        records = RECORDS_SIMPLE.tokenize(',').collate(4).collect {
+                            [name: it[0], type: it[1], ttl: it[2], value: it[3], routing_policy: 'Simple']
+                        }
+                    } else if (ROUTING_POLICY == 'Weighted') {
+                        records = RECORDS_WEIGHTED.tokenize(',').collate(5).collect {
+                            [name: it[0], type: it[1], ttl: it[2], value: it[3], weight: it[4], routing_policy: 'Weighted']
+                        }
+                    } else if (ROUTING_POLICY == 'Failover') {
+                        records = RECORDS_FAILOVER.tokenize(',').collate(5).collect {
+                            [name: it[0], type: it[1], ttl: it[2], value: it[3], failover: it[4], routing_policy: 'Failover']
+                        }
+                    }
+
+                    env.VPC_JSON = groovy.json.JsonOutput.toJson(vpcList)
+                    env.RDS_JSON = groovy.json.JsonOutput.toJson(rdsList)
+                    env.RECORDS_JSON = groovy.json.JsonOutput.toJson(records)
+                }
+            }
+        }
+
+        stage('Run Terraform') {
+            steps {
+                script {
+                    writeFile file: 'terraform.tfvars', text: """
+                        
+                        allow_destroy = ${ALLOW_DESTROY}
+                        is_private = ${IS_PRIVATE}
+                        vpc_associations = ${env.VPC_JSON}
+                        routing_policy = \"${ROUTING_POLICY}\"
+                        rds_endpoints = ${env.RDS_JSON}
+                        records = ${env.RECORDS_JSON}
+                    """
+                    sh 'terraform init'
+                    sh 'terraform apply -auto-approve'
+                }
+            }
+        }
+    }
+}
+
+----------------
+
+
+pipeline {
+    agent any
+    parameters {
+        
+        booleanParam(name: 'ALLOW_DESTROY', defaultValue: false, description: 'Allow Destroy')
+        booleanParam(name: 'IS_PRIVATE', defaultValue: true, description: 'Is Private Hosted Zone')
+        string(name: 'VPC_ASSOCIATIONS', description: 'VPC Associations (vpc_id:region,vpc_id:region)')
+        choice(name: 'ROUTING_POLICY', choices: ['Simple', 'Weighted', 'Failover'], description: 'Select Routing Policy')
+        string(name: 'RDS_ENDPOINTS', description: 'Custom RDS endpoints (name:endpoint,name:endpoint)')
+        string(name: 'RECORDS_SIMPLE', description: 'Records for Simple Routing (name,type,ttl,value)', defaultValue: '')
+        string(name: 'RECORDS_WEIGHTED', description: 'Records for Weighted Routing (name,type,ttl,value,weight)', defaultValue: '')
+        string(name: 'RECORDS_FAILOVER', description: 'Records for Failover Routing (name,type,ttl,value,failoverType)', defaultValue: '')
+    }
+
+    environment {
+        TFVARS_FILE = "terraform.tfvars"
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    def vpcList = params.VPC_ASSOCIATIONS.split(',').collect { entry ->
+                        def parts = entry.split(':')
+                        return "{ vpc_id = \"${parts[0]}\", region = \"${parts[1]}\" }"
+                    }.join(', ')
+
+                    def rdsList = params.RDS_ENDPOINTS.split(',').collect { entry ->
+                        def parts = entry.split(':')
+                        return "${parts[0]} = { custom_name = \"${parts[0]}\", endpoint = \"${parts[1]}\" }"
+                    }.join(', ')
+
+                    def recordsList = ''
+                    if (params.ROUTING_POLICY == 'Simple') {
+                        recordsList = params.RECORDS_SIMPLE.split(',').collate(4).collect { rec ->
+                            "{ name = \"${rec[0]}\", type = \"${rec[1]}\", ttl = ${rec[2]}, value_or_alias_target = \"${rec[3]}\", routing_policy = \"Simple\" }"
+                        }.join(', ')
+                    } else if (params.ROUTING_POLICY == 'Weighted') {
+                        recordsList = params.RECORDS_WEIGHTED.split(',').collate(5).collect { rec ->
+                            "{ name = \"${rec[0]}\", type = \"${rec[1]}\", ttl = ${rec[2]}, value_or_alias_target = \"${rec[3]}\", routing_policy = \"Weighted\", weight = ${rec[4]} }"
+                        }.join(', ')
+                    } else if (params.ROUTING_POLICY == 'Failover') {
+                        recordsList = params.RECORDS_FAILOVER.split(',').collate(5).collect { rec ->
+                            "{ name = \"${rec[0]}\", type = \"${rec[1]}\", ttl = ${rec[2]}, value_or_alias_target = \"${rec[3]}\", routing_policy = \"Failover\", failover = \"${rec[4]}\" }"
+                        }.join(', ')
+                    }
+
+                    def tfvarsContent = """
+                    
+                    allow_destroy = ${params.ALLOW_DESTROY}
+                    is_private = ${params.IS_PRIVATE}
+                    vpc_associations = [${vpcList}]
+                    routing_policy = \"${params.ROUTING_POLICY}\"
+                    rds_endpoints = {${rdsList}}
+                    records = [${recordsList}]
+                    """
+                    
+                    writeFile file: TFVARS_FILE, text: tfvarsContent
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            steps {
+                sh '''
+                terraform init
+                terraform apply -auto-approve -var-file=${TFVARS_FILE}
+                '''
+            }
+        }
+    }
+}
+------------------------------
+
+pipeline {
+    agent any
+
+    parameters {
+        
+
+        booleanParam(name: 'ALLOW_DESTROY', defaultValue: false, description: 'Allow Destroy')
+        booleanParam(name: 'IS_PRIVATE', defaultValue: true, description: 'Is Private Hosted Zone')
+
+        string(name: 'VPC_ASSOCIATIONS', description: 'VPC Associations (format: vpc1:region1,vpc2:region2)')
+        choice(name: 'ROUTING_POLICY', choices: ['Simple', 'Weighted', 'Failover'], description: 'Select Routing Policy')
+
+        string(name: 'RDS_ENDPOINTS', description: 'RDS Endpoints (format: name1:endpoint1,name2:endpoint2)')
+        string(name: 'RECORDS_SIMPLE', description: 'Simple Records (format: name,type,ttl,value)', defaultValue: '')
+        string(name: 'RECORDS_WEIGHTED', description: 'Weighted Records (format: name,type,ttl,value,weight)', defaultValue: '')
+        string(name: 'RECORDS_FAILOVER', description: 'Failover Records (format: name,type,ttl,value,failoverType)', defaultValue: '')
+
+        booleanParam(name: 'DRY_RUN', defaultValue: true, description: 'Enable Dry Run Mode')
+    }
+
+    environment {
+        TFVARS_FILE = "terraform.tfvars"
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    def vpcList = params.VPC_ASSOCIATIONS.tokenize(',').collect { vpc ->
+                        def parts = vpc.tokenize(':')
+                        return "{ vpc_id = \"${parts[0]}\", region = \"${parts[1]}\" }"
+                    }
+
+                    def rdsList = params.RDS_ENDPOINTS.tokenize(',').collect { endpoint ->
+                        def parts = endpoint.tokenize(':')
+                        return "\"${parts[0]}\" = { custom_name = \"${parts[0]}\", endpoint = \"${parts[1]}\" }"
+                    }
+
+                    def recordsList = []
+                    if (params.ROUTING_POLICY == "Simple" && params.RECORDS_SIMPLE) {
+                        recordsList = params.RECORDS_SIMPLE.tokenize(',').collect { rec ->
+                            def parts = rec.tokenize(',')
+                            return "{ name = \"${parts[0]}\", type = \"${parts[1]}\", ttl = ${parts[2]}, value_or_alias_target = \"${parts[3]}\", routing_policy = \"Simple\" }"
+                        }
+                    } else if (params.ROUTING_POLICY == "Weighted" && params.RECORDS_WEIGHTED) {
+                        recordsList = params.RECORDS_WEIGHTED.tokenize(',').collect { rec ->
+                            def parts = rec.tokenize(',')
+                            return "{ name = \"${parts[0]}\", type = \"${parts[1]}\", ttl = ${parts[2]}, value_or_alias_target = \"${parts[3]}\", routing_policy = \"Weighted\", weight = ${parts[4]} }"
+                        }
+                    } else if (params.ROUTING_POLICY == "Failover" && params.RECORDS_FAILOVER) {
+                        recordsList = params.RECORDS_FAILOVER.tokenize(',').collect { rec ->
+                            def parts = rec.tokenize(',')
+                            return "{ name = \"${parts[0]}\", type = \"${parts[1]}\", ttl = ${parts[2]}, value_or_alias_target = \"${parts[3]}\", routing_policy = \"Failover\", failover = \"${parts[4]}\" }"
+                        }
+                    }
+
+                    def tfvarsContent = """
+                    
+                    allow_destroy = ${params.ALLOW_DESTROY}
+                    is_private = ${params.IS_PRIVATE}
+                    vpc_associations = [ ${vpcList.join(', ')} ]
+                    routing_policy = \"${params.ROUTING_POLICY}\"
+                    rds_endpoints = { ${rdsList.join(', ')} }
+                    records = [ ${recordsList.join(', ')} ]
+                    """
+
+                    writeFile file: TFVARS_FILE, text: tfvarsContent
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                sh 'terraform init'
+                sh 'terraform validate'
+            }
+        }
+
+        stage('Dry Run') {
+            when {
+                expression { params.DRY_RUN }
+            }
+            steps {
+                echo "Performing Dry Run..."
+                sh 'terraform plan -var-file=${TFVARS_FILE} -out=tfplan'
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                sh 'terraform plan -var-file=${TFVARS_FILE}'
+            }
+        }
+
+        stage('Approval Before Apply') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            steps {
+                input message: 'Proceed with Terraform Apply?', ok: 'Apply'
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            steps {
+                sh 'terraform apply -auto-approve -var-file=${TFVARS_FILE}'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Terraform execution completed successfully!'
+        }
+        failure {
+            echo 'Terraform execution failed!'
+        }
+    }
+}
+
+
